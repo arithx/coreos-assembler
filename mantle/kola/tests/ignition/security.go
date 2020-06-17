@@ -82,6 +82,19 @@ func init() {
 		// Packet & QEMU: https://github.com/coreos/ignition/issues/645
 		ExcludePlatforms: []string{"do", "packet", "qemu"},
 	})
+	register.RegisterTest(&register.Test{
+		Name:        "coreos.ignition.security.tls.bundle",
+		Run:         securityTLSBundle,
+		ClusterSize: 1,
+		NativeFuncs: map[string]register.NativeFuncWrap{
+			"TLSServe":   register.CreateNativeFuncWrap(TLSServe),
+			"TLSServeV3": register.CreateNativeFuncWrap(TLSServeV3),
+		},
+		Tags: []string{"ignition"},
+		// DO: https://github.com/coreos/bugs/issues/2205
+		// Packet & QEMU: https://github.com/coreos/ignition/issues/645
+		ExcludePlatforms: []string{"do", "packet", "qemu"},
+	})
 }
 
 func securityTLS(c cluster.TestCluster) {
@@ -109,6 +122,88 @@ subjectAltName = IP:$IP
 EOF
 ) -extensions SAN'`, "$IP", ip, -1))
 	publicKey := c.MustSSH(server, "sudo cat /var/tls/server.crt")
+
+	var serveFunc string
+	var conf *conf.UserData
+	switch c.IgnitionVersion() {
+	case "v2":
+		serveFunc = "TLSServe"
+		conf = localSecurityClient
+	case "v3":
+		serveFunc = "TLSServeV3"
+		conf = localSecurityClientV3
+	default:
+		c.Fatal("unknown ignition version")
+	}
+
+	c.MustSSH(server, fmt.Sprintf("sudo systemd-run --quiet ./kolet run %s %s", c.H.Name(), serveFunc))
+
+	client, err := c.NewMachine(conf.Subst("$IP", ip).Subst("$KEY", dataurl.EncodeBytes(publicKey)))
+	if err != nil {
+		c.Fatalf("starting client: %v", err)
+	}
+
+	checkResources(c, client, map[string]string{
+		"data": "kola-data",
+	})
+}
+
+func securityTLSBundle(c cluster.TestCluster) {
+	server := c.Machines()[0]
+
+	ip := server.PrivateIP()
+	if c.Platform() == packet.Platform {
+		// private IP not configured in the initramfs
+		ip = server.IP()
+	}
+
+	c.MustSSH(server, "sudo mkdir /var/tls")
+	c.MustSSH(server, "sudo openssl ecparam -genkey -name secp384r1 -out /var/tls/server.key")
+	c.MustSSH(server, fmt.Sprintf(`sudo bash -c 'openssl req -new -key /var/tls/server.key -out /var/tls/server.csr -subj "/CN=%[1]s" -config <(cat <<-EOF
+[req]
+default_bits = 2048
+default_md = sha256
+distinguished_name = dn
+
+[ dn ]
+CN = %[1]s
+
+[ SAN ]
+subjectAltName = IP:%[1]s
+EOF
+) -extensions SAN'`, ip))
+	c.MustSSH(server, fmt.Sprintf(`sudo bash -c 'openssl x509 -req -days 3650 -in /var/tls/server.csr -signkey /var/tls/server.key -out /var/tls/server.crt -extensions v3_req -extfile <(cat <<-EOF
+[ v3_req ]
+subjectAltName = IP:%[1]s
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+basicConstraints = critical,CA:TRUE
+EOF
+)'`, ip))
+	c.MustSSH(server, "sudo openssl ecparam -genkey -name secp384r1 -out /var/tls/server_B.key")
+	c.MustSSH(server, fmt.Sprintf(`sudo bash -c 'openssl req -new -key /var/tls/server_B.key -out /var/tls/server_B.csr -subj "/CN=%[1]s" -config <(cat <<-EOF
+[req]
+default_bits = 2048
+default_md = sha256
+distinguished_name = dn
+
+[ dn ]
+CN = %[1]s
+
+[ SAN ]
+subjectAltName = IP:%[1]s
+EOF
+) -extensions SAN'`, ip))
+	c.MustSSH(server, fmt.Sprintf(`sudo bash -c 'openssl x509 -req -days 3650 -in /var/tls/server_B.csr -signkey /var/tls/server_B.key -out /var/tls/server_B.crt -extensions v3_req -extfile <(cat <<-EOF
+[ v3_req ]
+subjectAltName = IP:%[1]s
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+basicConstraints = critical,CA:TRUE
+EOF
+)'`, ip))
+	c.MustSSH(server, "sudo bash -c 'cat /var/tls/server_B.crt /var/tls/server.crt > /var/tls/bundle.crt'")
+	publicKey := c.MustSSH(server, "sudo cat /var/tls/bundle.crt")
 
 	var serveFunc string
 	var conf *conf.UserData
